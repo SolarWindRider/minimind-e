@@ -10,7 +10,42 @@ import torch.distributed as dist
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 from model.model_omni import MiniMindOmni
-    
+from torch.optim.lr_scheduler import LambdaLR
+
+
+def load_tokenizer(tokenizer_path):
+    """Load tokenizer from path, supporting both HuggingFace format and native format."""
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        return tokenizer
+    except Exception as e:
+        print(f"Failed to load tokenizer from {tokenizer_path}: {e}")
+        import json
+        config_path = os.path.join(tokenizer_path, "tokenizer_config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                config = json.load(f)
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.get("model_max_length", 2048),
+                bos_token=config.get("bos_token", "<|roll|>"),
+                eos_token=config.get("eos_token", "<|endoftext|>"),
+                pad_token=config.get("pad_token", "<|pad|>"),
+                unk_token=config.get("unk_token", "<|unk|>"),
+            )
+            return tokenizer
+        raise RuntimeError(f"Cannot load tokenizer from {tokenizer_path}")
+
+
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+    """Create a schedule with a learning rate that decreases following the cosine function."""
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    return LambdaLR(optimizer, lr_lambda)
+
 
 
 def is_main_process():
