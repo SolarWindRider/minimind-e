@@ -1,196 +1,286 @@
-import os, sys, json, argparse, torch, re
+"""
+VLA 评估脚本
+
+支持两种评估模式：
+1. 离线评估：在收集的数据集上评估
+2. 在线评估：直接在仿真器上评估（使用与训练不同的随机种子）
+"""
+
+import gymnasium as gym
+import gymnasium_robotics
+import numpy as np
+import torch
+import argparse
+import os
+import json
+import sys
 from tqdm import tqdm
+from typing import List, Dict, Tuple
+from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model.model_vla import MiniMindVLA, VLAConfig
-from model.model_minimind import MiniMindConfig
-from dataset.vla_dataset import VLADataset
+from model.model_vla import MiniMindVLAStep, VLAConfig
 from trainer.trainer_utils import load_tokenizer
 
 
-def normalize_action(action):
-    if not action:
-        return ""
-    action = action.strip().lower()
-    action = re.sub(r'\s+', ' ', action)
+DISCRETE_ACTIONS = [
+    "move_left", "move_right", "move_forward", "move_backward",
+    "move_up", "move_down", "grip_close", "grip_open", "stay"
+]
+
+
+def discrete_to_continuous(action_idx, magnitude=0.05):
+    action = np.zeros(4)
+    if action_idx == 0: action[0] = -magnitude
+    elif action_idx == 1: action[0] = magnitude
+    elif action_idx == 2: action[1] = magnitude
+    elif action_idx == 3: action[1] = -magnitude
+    elif action_idx == 4: action[2] = magnitude
+    elif action_idx == 5: action[2] = -magnitude
+    elif action_idx == 6: action[3] = -magnitude
+    elif action_idx == 7: action[3] = magnitude
     return action
 
 
-def compute_sequence_accuracy(pred_actions, target_actions):
-    if not target_actions:
-        return 0.0
+def encode_state_as_text(obs):
+    achieved_goal = obs['achieved_goal']
+    desired_goal = obs['desired_goal']
+    rel_x, rel_y, rel_z = achieved_goal - desired_goal
+    dist = np.linalg.norm([rel_x, rel_y, rel_z])
 
-    pred_norm = [normalize_action(a) for a in pred_actions]
-    target_norm = [normalize_action(a) for a in target_actions]
+    instructions = []
+    if rel_x < -0.05: instructions.append("puck is to the right of target")
+    elif rel_x > 0.05: instructions.append("puck is to the left of target")
+    if rel_y < -0.05: instructions.append("puck is behind target")
+    elif rel_y > 0.05: instructions.append("puck is in front of target")
+    if rel_z < -0.02: instructions.append("puck is below target")
+    elif rel_z > 0.02: instructions.append("puck is above target")
+    if dist < 0.05: instructions.append("puck is close to goal")
+    elif dist > 0.2: instructions.append("puck is far from goal")
+    if not instructions: instructions.append("adjust puck position")
+    return " ".join(instructions)
 
-    if pred_norm == target_norm:
-        return 1.0
 
-    if len(target_norm) == 0:
-        return 0.0
+def compute_metrics(pred_actions: List[str], gt_actions: List[str]) -> Dict:
+    """计算动作预测准确率"""
+    if len(pred_actions) != len(gt_actions):
+        min_len = min(len(pred_actions), len(gt_actions))
+        pred_actions = pred_actions[:min_len]
+        gt_actions = gt_actions[:min_len]
 
-    correct = sum(1 for p, t in zip(pred_norm, target_norm) if p == t)
-    return correct / len(target_norm)
+    correct = sum(1 for p, g in zip(pred_actions, gt_actions) if p == g)
+    accuracy = correct / len(gt_actions) if gt_actions else 0.0
+
+    return {
+        "accuracy": accuracy,
+        "num_steps": len(gt_actions),
+        "correct_steps": correct,
+    }
 
 
-def run_inference(args):
-    device = torch.device(f"cuda:{args.local_rank}") if torch.cuda.is_available() and args.local_rank >= 0 else torch.device("cpu")
+class VLARobotEvaluator:
+    def __init__(self, model, tokenizer, device='cuda', max_history=10):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.max_history = max_history
+        self.model.eval()
 
-    print(f"Loading tokenizer from {args.tokenizer_path}...")
+    def construct_input(self, instruction: str, history: List[str]) -> torch.Tensor:
+        prompt = f"Task: {instruction}"
+        prompt_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids
+        input_ids = [self.tokenizer.bos_token_id] + prompt_ids + [2]
+        for action in history[-self.max_history:]:
+            input_ids.append(self.model.encode_action(action))
+        input_ids.append(1)
+        return torch.tensor([input_ids], dtype=torch.long, device=self.device)
+
+    def predict_action(self, instruction: str, history: List[str], pixel_values=None) -> Tuple[int, float]:
+        """
+        预测下一动作
+
+        Returns:
+            action_idx: 动作索引 (0-8)，直接可用于 discrete_to_continuous()
+            confidence: 置信度
+        """
+        input_ids = self.construct_input(instruction, history)
+
+        with torch.no_grad():
+            action_idx, confidence = self.model.predict_next_action(
+                input_ids, pixel_values=pixel_values, temperature=0.7
+            )
+
+        return action_idx, float(confidence)
+
+
+def evaluate_on_dataset(evaluator: VLARobotEvaluator, dataset_path: str, max_samples=1000) -> Dict:
+    """在离线数据集上评估"""
+    with open(dataset_path) as f:
+        data = json.load(f)
+
+    trajectories = data.get('trajectories', [])
+    if isinstance(data, dict) and 'trajectories' not in data:
+        trajectories = data
+
+    trajectories = trajectories[:max_samples]
+
+    all_metrics = []
+    for traj in tqdm(trajectories, desc="Evaluating on dataset"):
+        instruction = traj.get('instruction', '')
+        steps = traj.get('steps', [])
+
+        if not steps:
+            continue
+
+        history = []
+        pred_actions = []
+        gt_actions = []
+
+        for step in steps:
+            gt_action = step.get('action', '')
+            if not gt_action:
+                continue
+
+            action_idx, _ = evaluator.predict_action(instruction, history)
+
+            pred_actions.append(DISCRETE_ACTIONS[action_idx])
+            gt_actions.append(gt_action)
+            history.append(DISCRETE_ACTIONS[action_idx])
+
+        metrics = compute_metrics(pred_actions, gt_actions)
+        all_metrics.append(metrics)
+
+    avg_accuracy = np.mean([m['accuracy'] for m in all_metrics])
+    avg_steps = np.mean([m['num_steps'] for m in all_metrics])
+
+    return {
+        "accuracy": avg_accuracy,
+        "avg_steps": avg_steps,
+        "num_episodes": len(all_metrics),
+    }
+
+
+def evaluate_on_simulator(evaluator: VLARobotEvaluator, env_id: str, num_episodes: int = 100,
+                          seed: int = 99999, max_steps: int = 50) -> Dict:
+    """
+    在仿真器上直接评估
+
+    使用与训练不同的随机种子，确保测试环境是模型未见过的
+    """
+    gym.register_envs(gymnasium_robotics)
+    env = gym.make(env_id, render_mode='rgb_array')
+
+    all_results = []
+    success_count = 0
+
+    for episode in tqdm(range(num_episodes), desc="Evaluating on simulator"):
+        obs, info = env.reset(seed=seed + episode)
+
+        instruction = encode_state_as_text(obs)
+        history = []
+        episode_reward = 0
+
+        for step in range(max_steps):
+            action_idx, _ = evaluator.predict_action(instruction, history)
+
+            # 直接用 action_idx，不需要字符串转换
+            continuous_action = discrete_to_continuous(action_idx)
+            obs, reward, terminated, truncated, info = env.step(continuous_action)
+
+            episode_reward += reward
+            history.append(DISCRETE_ACTIONS[action_idx])
+
+            if terminated or truncated:
+                if reward > -10:  # 成功阈值
+                    success_count += 1
+                break
+
+        all_results.append({
+            "episode": episode,
+            "reward": episode_reward,
+            "steps": len(history),
+            "success": terminated or episode_reward > -10,
+        })
+
+    env.close()
+
+    success_rate = success_count / num_episodes
+    avg_reward = np.mean([r['reward'] for r in all_results])
+    avg_steps = np.mean([r['steps'] for r in all_results])
+
+    return {
+        "success_rate": success_rate,
+        "avg_reward": avg_reward,
+        "avg_steps": avg_steps,
+        "num_episodes": num_episodes,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate VLA robot controller")
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to VLA checkpoint")
+    parser.add_argument("--tokenizer_path", type=str, default="./model")
+    parser.add_argument("--vision_model_path", type=str, default="./model/siglip2-base-p32-256-ve")
+    parser.add_argument("--eval_mode", choices=['dataset', 'simulator', 'both'], default='simulator', help="Evaluation mode")
+    parser.add_argument("--dataset_path", type=str, default="../dataset/robot_data/test_trajectories.json", help="Path to test dataset")
+    parser.add_argument("--env_id", type=str, default="FetchSlide-v3", help="Gymnasium environment ID")
+    parser.add_argument("--num_episodes", type=int, default=100, help="Number of episodes for evaluation")
+    parser.add_argument("--test_seed", type=int, default=12345, help="Test set random seed")
+    parser.add_argument("--max_samples", type=int, default=1000, help="Max samples from dataset")
+    parser.add_argument("--max_steps", type=int, default=50, help="Max steps per episode")
+    parser.add_argument("--output_path", type=str, default="./eval_results.json", help="Output path for results")
+    parser.add_argument("--device", type=str, default="cuda", help="Device")
+    args = parser.parse_args()
+
+    print(f"Loading VLA from {args.checkpoint_path}...")
+
     tokenizer = load_tokenizer(args.tokenizer_path)
-
-    print(f"Loading VLA model from {args.checkpoint_path}...")
-    vla_config = VLAConfig(
-        vocab_size=len(tokenizer),
-        hidden_size=768,
-        intermediate_size=2048,
-        num_hidden_layers=8,
-        num_attention_heads=12,
-        num_key_value_heads=12,
-        num_action_hidden_layers=4,
-        action_hidden_size=768,
-        action_vocab_size=args.action_vocab_size,
-        max_position_embeddings=2048,
-        use_moe=args.use_moe,
-        num_experts=8,
-        moe_intermediate_size=1408,
-    )
-
-    model = MiniMindVLA(vla_config, vision_model_path=args.vision_model_path)
-    model.resize_token_embeddings(len(tokenizer))
 
     checkpoint_file = os.path.join(args.checkpoint_path, "pytorch_model.bin")
     if os.path.exists(checkpoint_file):
-        state_dict = torch.load(checkpoint_file, map_location=device)
-        model.load_state_dict(state_dict, strict=False)
+        checkpoint = torch.load(checkpoint_file, map_location=args.device)
+        vla_config = checkpoint.get('config', VLAConfig())
+        action_vocab = checkpoint.get('action_vocab', DISCRETE_ACTIONS)
     else:
-        ckpt_files = [f for f in os.listdir(args.checkpoint_path) if f.endswith('.pt') or f.endswith('.pth')]
-        if ckpt_files:
-            state_dict = torch.load(os.path.join(args.checkpoint_path, ckpt_files[0]), map_location=device)
-            if isinstance(state_dict, dict) and 'model' in state_dict:
-                state_dict = state_dict['model']
-            model.load_state_dict(state_dict, strict=False)
+        vla_config = VLAConfig()
+        action_vocab = DISCRETE_ACTIONS
 
-    model = model.to(device)
-    model.eval()
+    model = MiniMindVLAStep(vla_config, vision_model_path=args.vision_model_path)
+    model.resize_token_embeddings(len(tokenizer))
+    if os.path.exists(checkpoint_file):
+        model.load_state_dict(checkpoint.get('model', checkpoint), strict=False)
+    model.set_action_vocabulary(action_vocab)
+    model = model.to(args.device)
 
-    print(f"Loading evaluation dataset from {args.eval_data_path}...")
-    eval_dataset = VLADataset(
-        data_path=args.eval_data_path,
-        tokenizer=tokenizer,
-        vision_processor=None if model.vision_encoder is None else model.vision_processor,
-        max_length=args.max_seq_len,
-        images_folder=args.images_folder,
-    )
+    evaluator = VLARobotEvaluator(model, tokenizer, device=args.device)
 
-    print(f"Running inference on {len(eval_dataset)} samples...")
+    results = {}
 
-    all_results = []
-    seq_accuracies = []
-    exact_matches = 0
-
-    for idx in tqdm(range(min(len(eval_dataset), args.max_samples))):
-        item = eval_dataset.list_data_dict[idx]
-        instruction = item.get('instruction', '')
-        target_actions = item.get('actions', [])
-
-        if not instruction:
-            continue
-
-        prompt = f"You are a household assistant. Task: {instruction}"
-        prompt_with_image = f"{eval_dataset.image_token}\n{prompt}"
-
-        input_ids = tokenizer(prompt_with_image, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-        input_ids = torch.cat([torch.tensor([[tokenizer.bos_token_id]], device=device), input_ids], dim=1) if tokenizer.bos_token_id else input_ids
-
-        pixel_values = None
-        if 'image' in item and item['image']:
-            pixel_values = eval_dataset.load_image_inputs(item['image'])
-        if pixel_values is None:
-            pixel_values = {'pixel_values': torch.zeros(1, 3, 256, 256).to(device)}
-        if isinstance(pixel_values, dict):
-            pixel_values = {k: v.to(device) if torch.is_tensor(v) else v for k, v in pixel_values.items()}
+    if args.eval_mode in ['dataset', 'both']:
+        if os.path.exists(args.dataset_path):
+            print(f"\n=== Evaluating on Dataset: {args.dataset_path} ===")
+            dataset_metrics = evaluate_on_dataset(evaluator, args.dataset_path, args.max_samples)
+            results['dataset'] = dataset_metrics
+            print(f"Dataset Accuracy: {dataset_metrics['accuracy']:.4f}")
         else:
-            pixel_values = pixel_values.to(device)
+            print(f"Dataset not found: {args.dataset_path}")
 
-        with torch.no_grad():
-            generated_ids = model.generate_actions(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                use_cache=True,
-            )
-
-        pred_action_ids = generated_ids[0].cpu().tolist()
-        pred_actions = eval_dataset.decode_actions(pred_action_ids)
-
-        seq_acc = compute_sequence_accuracy(pred_actions, target_actions)
-        seq_accuracies.append(seq_acc)
-
-        if pred_actions and target_actions:
-            pred_norm = [normalize_action(a) for a in pred_actions]
-            target_norm = [normalize_action(a) for a in target_actions]
-            if pred_norm == target_norm:
-                exact_matches += 1
-
-        result = {
-            "idx": idx,
-            "instruction": instruction,
-            "target_actions": target_actions,
-            "predicted_actions": pred_actions,
-            "seq_accuracy": seq_acc,
-        }
-        all_results.append(result)
-
-        if idx < 5:
-            print(f"\n--- Sample {idx} ---")
-            print(f"Instruction: {instruction[:100]}...")
-            print(f"Target: {target_actions[:5]}...")
-            print(f"Predicted: {pred_actions[:5]}...")
-            print(f"Seq Acc: {seq_acc:.4f}")
-
-    avg_seq_acc = sum(seq_accuracies) / len(seq_accuracies) if seq_accuracies else 0.0
-    exact_match_rate = exact_matches / len(seq_accuracies) if seq_accuracies else 0.0
-
-    print(f"\n=== Evaluation Results ===")
-    print(f"Total samples: {len(seq_accuracies)}")
-    print(f"Sequence Accuracy: {avg_seq_acc:.4f}")
-    print(f"Exact Match Rate: {exact_match_rate:.4f}")
-
-    metrics = {
-        "sequence_accuracy": avg_seq_acc,
-        "exact_match_rate": exact_match_rate,
-        "num_samples": len(seq_accuracies),
-    }
+    if args.eval_mode in ['simulator', 'both']:
+        print(f"\n=== Evaluating on Simulator (seed={args.test_seed}) ===")
+        sim_metrics = evaluate_on_simulator(
+            evaluator, args.env_id, args.num_episodes, args.test_seed, args.max_steps
+        )
+        results['simulator'] = sim_metrics
+        print(f"Success Rate: {sim_metrics['success_rate']:.4f}")
+        print(f"Average Reward: {sim_metrics['avg_reward']:.3f}")
+        print(f"Average Steps: {sim_metrics['avg_steps']:.1f}")
 
     if args.output_path:
         os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
         with open(args.output_path, 'w') as f:
-            json.dump({
-                "metrics": metrics,
-                "samples": all_results,
-            }, f, indent=2, ensure_ascii=False)
-        print(f"Results saved to {args.output_path}")
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to: {args.output_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to VLA model checkpoint")
-    parser.add_argument("--eval_data_path", type=str, required=True, help="Path to evaluation dataset")
-    parser.add_argument("--tokenizer_path", type=str, default="./model")
-    parser.add_argument("--vision_model_path", type=str, default="./model/siglip2-base-p32-256-ve")
-    parser.add_argument("--images_folder", type=str, default="", help="Base folder for images")
-    parser.add_argument("--action_vocab_size", type=int, default=512)
-    parser.add_argument("--max_seq_len", type=int, default=512)
-    parser.add_argument("--max_new_tokens", type=int, default=50)
-    parser.add_argument("--max_samples", type=int, default=1000)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--top_p", type=float, default=0.9)
-    parser.add_argument("--output_path", type=str, default="./eval_results.json")
-    parser.add_argument("--local_rank", type=int, default=-1)
-    parser.add_argument("--use_moe", type=int, default=0)
-    args = parser.parse_args()
-
-    run_inference(args)
+    main()

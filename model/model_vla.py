@@ -1,5 +1,4 @@
-import os, math, torch, warnings, numpy as np, logging, contextlib, io
-from types import SimpleNamespace
+import os, math, torch, warnings, numpy as np
 from torch import nn
 from torch.nn import functional as F
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
@@ -8,7 +7,7 @@ from .model_minimind import *
 
 
 class VLAConfig(MiniMindConfig):
-    model_type = "minimind-vla"
+    model_type = "minimind-vla-step"
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.num_action_hidden_layers = kwargs.get("num_action_hidden_layers", 4)
@@ -24,7 +23,6 @@ class VLAConfig(MiniMindConfig):
         self.image_hidden_size = kwargs.get("image_hidden_size", 768)
         self.image_token_len = kwargs.get("image_token_len", 64)
         self.bridge_layer = kwargs.get("bridge_layer", self.num_hidden_layers // 2 - 1)
-        self.action_stop_ids = kwargs.get("action_stop_ids", [26, 234, 234])
 
 
 class MMActionProjector(nn.Module):
@@ -41,7 +39,7 @@ class MMActionProjector(nn.Module):
 
 
 class MMVisionProjector(nn.Module):
-    def __init__(self, in_dim, out_dim, source_tokens=64, target_tokens=64):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -87,42 +85,53 @@ class ActionModule(nn.Module):
         self.norm = RMSNorm(config.action_hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ActionHead(config.action_hidden_size, config.action_vocab_size)
         self.embed_tokens = ActionEmbedding(config.action_vocab_size, config.action_hidden_size)
-        self.action_proj = nn.Sequential(
-            nn.Linear(config.action_hidden_size, config.action_hidden_size),
-            nn.GELU(),
-            nn.Linear(config.action_hidden_size, config.action_hidden_size),
-            RMSNorm(config.action_hidden_size, eps=config.rms_norm_eps)
-        )
         self.embed_proj = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.GELU(),
             nn.Linear(config.hidden_size, config.action_hidden_size),
             RMSNorm(config.action_hidden_size, eps=config.rms_norm_eps)
         )
-        self.text_scale, self.action_scale = nn.Parameter(torch.tensor(3.0)), nn.Parameter(torch.tensor(1.0))
+        self.text_scale = nn.Parameter(torch.tensor(3.0))
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.action_config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
 
-class MiniMindVLA(MiniMindForCausalLM):
+class MiniMindVLAStep(nn.Module):
+    """
+    时序 VLA 模型：每个时间步接收 (图像 + 指令 + 历史动作) → 输出下一动作
+
+    真正的时序控制能力：
+    - 训练：给定前 N 个 (obs, action) 对，预测第 N+1 个动作
+    - 推理：循环执行，观察 → 动作 → 观察 → 动作 → ...
+    """
+
     config_class = VLAConfig
+
     def __init__(self, config: VLAConfig = None, vision_model_path="./model/siglip2-base-p32-256-ve"):
         config = config or VLAConfig()
-        super().__init__(config)
-        object.__setattr__(self, 'thinker', self.model)
-        object.__setattr__(self.model, 'lm_head', self.lm_head)
-        self.action = ActionModule(config)
-        self.vision_proj = MMVisionProjector(config.image_hidden_size, config.hidden_size, target_tokens=config.image_token_len)
-        self.action_pad_token, self.action_stop_token = config.action_pad_token, config.action_stop_token
-        vision_encoder, vision_processor = self.load_vision(vision_model_path)
-        object.__setattr__(self, 'vision_encoder', vision_encoder)
-        object.__setattr__(self, 'vision_processor', vision_processor)
+        super().__init__()
+        self.config = config
 
-    @staticmethod
-    def load_vision(path):
+        self.thinker = MiniMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.thinker.lm_head = self.lm_head
+
+        self.action = ActionModule(config)
+        self.vision_proj = MMVisionProjector(config.image_hidden_size, config.hidden_size)
+        self.action_pad_token = config.action_pad_token
+        self.action_stop_token = config.action_stop_token
+
+        self.action_id_to_token = {}
+        self.action_token_to_id = {}
+
+        vision_encoder, vision_processor = self._load_vision(vision_model_path)
+        self.vision_encoder = vision_encoder
+        self.vision_processor = vision_processor
+
+    def _load_vision(self, path):
         if path is None or not os.path.exists(path):
-            warnings.warn(f"[MiniMindVLA] Vision model path not found: {path}. vision_encoder will be None!")
+            warnings.warn(f"[MiniMindVLAStep] Vision model path not found: {path}")
             return None, None
         hf_logging.set_verbosity_error()
         try:
@@ -134,93 +143,96 @@ class MiniMindVLA(MiniMindForCausalLM):
             p.requires_grad = False
         return model.eval(), processor
 
-    @torch.compiler.disable
-    def get_image_embeddings(self, image_inputs):
-        if hasattr(image_inputs, 'keys'):
-            image_inputs = {k: v.squeeze(1) if v.ndim > 2 and v.shape[1] == 1 else v for k, v in image_inputs.items()}
-            pixel_attention_mask = image_inputs.get('pixel_attention_mask')
-            if pixel_attention_mask is not None and not pixel_attention_mask.any():
-                pv = image_inputs['pixel_values']
-                return pv.new_zeros(pv.size(0), pv.size(1), self.config.image_hidden_size)
+    def set_action_vocabulary(self, action_vocab):
+        self.action_id_to_token = {}
+        self.action_token_to_id = {}
+        for idx, action in enumerate(action_vocab):
+            token_id = idx + 10
+            self.action_id_to_token[token_id] = action
+            self.action_token_to_id[action] = token_id
+        self.action_id_to_token[0] = "<pad>"
+        self.action_id_to_token[1] = "<stop>"
+        self.action_id_to_token[2] = "<start>"
+        self.action_token_to_id["<pad>"] = 0
+        self.action_token_to_id["<stop>"] = 1
+        self.action_token_to_id["<start>"] = 2
+
+    def get_image_embeddings(self, pixel_values):
+        if pixel_values is None or self.vision_encoder is None:
+            return None
         with torch.no_grad():
-            outputs = self.vision_encoder(**image_inputs)
+            outputs = self.vision_encoder(**pixel_values)
         return outputs.last_hidden_state
 
     @torch.compiler.disable
-    def encode_image_inputs(self, pixel_values):
-        if pixel_values is None or self.vision_encoder is None:
-            return None
-        mask = pixel_values.flatten(1).any(1)
-        if not mask.any():
-            return pixel_values.new_zeros(pixel_values.size(0), self.config.image_token_len, self.config.hidden_size)
-        with torch.no_grad():
-            emb = self.vision_encoder(pixel_values=pixel_values[mask]).last_hidden_state
-        if emb.dim() == 2:
-            emb = emb.unsqueeze(0)
-        emb = self.vision_proj(emb)
-        if mask.all():
-            return emb
-        idx = mask.nonzero().view(-1, 1, 1).expand_as(emb)
-        return emb.new_zeros(pixel_values.size(0), *emb.shape[1:]).scatter(0, idx, emb)
+    def inject_vision_features(self, input_ids, hidden_states, pixel_values, seqlen):
+        if pixel_values is None:
+            return hidden_states
 
-    @torch.compiler.disable
-    def count_vision_proj(self, tokens, h, vision_tensors=None, seqlen=512):
-        if vision_tensors is None or not self.config.image_ids:
-            return h
-        marker, vf = self.config.image_ids[0], vision_tensors
-        if vf.dim() == 3:
-            vf = vf.unsqueeze(1)
+        marker = self.config.image_ids[0]
+        img_emb = self.get_image_embeddings(pixel_values)
+        if img_emb is None:
+            return hidden_states
+
+        img_emb = self.vision_proj(img_emb)
+        batch_size = hidden_states.size(0)
         out = []
-        for b in range(h.size(0)):
-            hb, seq, k, i = h[b], tokens[b].tolist(), 0, 0
+        for b in range(batch_size):
+            hb = hidden_states[b]
+            seq = input_ids[b].tolist()
+            new_hb = []
+            i = 0
             while i < len(seq):
                 if seq[i] == marker:
-                    start = i
-                    while i < len(seq) and seq[i] == marker:
-                        i += 1
-                    if k < vf.size(1):
-                        hb = torch.cat((hb[:start], vf[b][k][:i - start], hb[i:]), dim=0)[:seqlen]
-                        k += 1
-                else:
+                    new_hb.append(img_emb[b])
                     i += 1
-            out.append(hb)
+                else:
+                    new_hb.append(hb[i])
+                    i += 1
+            if len(new_hb) < seqlen:
+                new_hb = new_hb + [hb[len(new_hb):] if len(new_hb) < len(hb) else torch.zeros_like(hb[0])]
+            out.append(torch.stack(new_hb[:seqlen]) if isinstance(new_hb[0], torch.Tensor) else torch.tensor(new_hb[:seqlen]))
         return torch.stack(out)
 
-    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, pixel_values=None, **args):
+    def forward(self, input_ids, pixel_values=None, attention_mask=None, past_key_values=None, use_cache=False, **args):
         batch_size, seq_length = input_ids.shape
+
         if hasattr(past_key_values, 'layers'):
             past_key_values = None
-        n_thinker, n_action = len(self.thinker.layers), len(self.action.layers)
+
+        n_thinker = len(self.thinker.layers)
+        n_action = len(self.action.layers)
         past_key_values = past_key_values or ([None] * (n_thinker + n_action))
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         if self.thinker.freqs_cos[0, 0] == 0:
-            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
-            self.thinker.freqs_cos, self.thinker.freqs_sin = freqs_cos.to(input_ids.device), freqs_sin.to(input_ids.device)
+            freqs_cos, freqs_sin = precompute_freqs_cis(
+                dim=self.config.head_dim,
+                end=self.config.max_position_embeddings,
+                rope_base=self.config.rope_theta,
+                rope_scaling=self.config.rope_scaling
+            )
+            self.thinker.freqs_cos = freqs_cos.to(input_ids.device)
+            self.thinker.freqs_sin = freqs_sin.to(input_ids.device)
+
         if self.action.freqs_cos[0, 0] == 0:
-            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.action.action_config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
-            self.action.freqs_cos, self.action.freqs_sin = freqs_cos.to(input_ids.device), freqs_sin.to(input_ids.device)
+            freqs_cos, freqs_sin = precompute_freqs_cis(
+                dim=self.action.action_config.head_dim,
+                end=self.config.max_position_embeddings,
+                rope_base=self.config.rope_theta,
+                rope_scaling=self.config.rope_scaling
+            )
+            self.action.freqs_cos = freqs_cos.to(input_ids.device)
+            self.action.freqs_sin = freqs_sin.to(input_ids.device)
+
         presents = []
 
         hidden_states = self.thinker.dropout(self.thinker.embed_tokens(input_ids))
-        position_embeddings = (self.thinker.freqs_cos[start_pos:start_pos + seq_length], self.thinker.freqs_sin[start_pos:start_pos + seq_length])
+        position_embeddings = (self.thinker.freqs_cos[start_pos:start_pos + seq_length],
+                               self.thinker.freqs_sin[start_pos:start_pos + seq_length])
 
         if pixel_values is not None and start_pos == 0:
-            if hasattr(pixel_values, 'keys'):
-                img_emb = self.get_image_embeddings(pixel_values).to(hidden_states.dtype)
-                vision_tensors = self.vision_proj(img_emb)
-            else:
-                if len(pixel_values.shape) == 6:
-                    pixel_values = pixel_values.squeeze(2)
-                if len(pixel_values.shape) == 4:
-                    pixel_values = pixel_values.unsqueeze(1)
-                bs, num, c, im_h, im_w = pixel_values.shape
-                stack_dim = 1 if bs > 1 else 0
-                vision_tensors = torch.stack([
-                    self.encode_image_inputs(pixel_values[:, i, :, :, :])
-                    for i in range(num)
-                ], dim=stack_dim)
-            hidden_states = self.count_vision_proj(tokens=input_ids, h=hidden_states, vision_tensors=vision_tensors, seqlen=seq_length)
+            hidden_states = self.inject_vision_features(input_ids, hidden_states, pixel_values, seq_length)
 
         bridge_states = hidden_states
         for i, (layer, past_key_value) in enumerate(zip(self.thinker.layers, past_key_values[:n_thinker])):
@@ -231,64 +243,182 @@ class MiniMindVLA(MiniMindForCausalLM):
         h_thinker = self.thinker.norm(hidden_states)
 
         action_emb = self.action.embed_tokens(input_ids)
-        hidden_states = self.action.embed_proj(bridge_states) * self.action.text_scale + self.action.action_proj(action_emb) * self.action.action_scale
-        action_pos_emb = (self.action.freqs_cos[start_pos:start_pos + seq_length], self.action.freqs_sin[start_pos:start_pos + seq_length])
+        action_hidden = self.action.embed_proj(bridge_states) * self.action.text_scale + action_emb
+        action_position_embeddings = (self.action.freqs_cos[start_pos:start_pos + seq_length],
+                                     self.action.freqs_sin[start_pos:start_pos + seq_length])
         for layer, past_key_value in zip(self.action.layers, past_key_values[n_thinker:]):
-            hidden_states, present = layer(hidden_states, action_pos_emb, past_key_value=past_key_value, use_cache=use_cache, attention_mask=attention_mask)
+            action_hidden, present = layer(action_hidden, action_position_embeddings, past_key_value=past_key_value, use_cache=use_cache, attention_mask=attention_mask)
             presents.append(present)
-        h_action = self.action.norm(hidden_states)
+        h_action = self.action.norm(action_hidden)
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        action_logits = self.action.lm_head(h_action)
+
         aux_loss = sum(l.mlp.aux_loss for l in list(self.thinker.layers) + list(self.action.layers) if isinstance(l.mlp, MOEFeedForward))
-        aux_loss += sum(p.sum() for p in self.vision_proj.parameters()) * 0
-        text_logits = self.thinker.lm_head(h_thinker[:, slice_indices, :])
-        action_logits = self.action.lm_head(h_action[:, slice_indices, :])
 
-        out = MoeCausalLMOutputWithPast(aux_loss=aux_loss, logits=text_logits, past_key_values=presents)
-        out.action_logits = action_logits
-        return out
+        return MoeCausalLMOutputWithPast(
+            logits=action_logits,
+            past_key_values=presents,
+            aux_loss=aux_loss
+        )
 
-    @torch.inference_mode()
-    def generate_actions(self, input_ids, pixel_values=None, max_new_tokens=128, temperature=0.7, top_p=0.9, use_cache=True, eos_token_id=None):
-        if eos_token_id is None:
-            eos_token_id = self.config.action_stop_token
+    def predict_action_logits(self, input_ids, pixel_values=None, use_cache=True):
+        """
+        获取动作 logits（不采样）
+        输入: (图像, 指令, 历史动作) → 输出: action_logits [1, action_vocab_size]
+        """
+        out = self.forward(
+            input_ids,
+            pixel_values=pixel_values,
+            past_key_values=None,
+            use_cache=use_cache,
+        )
+        return out.logits[:, -1, :]  # [1, action_vocab_size]
 
-        start_pos = input_ids.shape[1]
-        past_kvs = None
-        finished = [False] * input_ids.shape[0]
+    def predict_next_action(self, input_ids, pixel_values=None, max_new_tokens=1, temperature=0.7, top_p=0.9, use_cache=True):
+        """
+        预测下一个动作（单步）
+        输入: (图像, 指令, 历史动作) → 输出: (action_idx, confidence)
 
-        while input_ids.shape[1] < start_pos + max_new_tokens:
-            out = self.forward(
-                input_ids,
-                pixel_values=pixel_values,
-                past_key_values=past_kvs,
-                use_cache=use_cache,
-            )
-            past_kvs = out.past_key_values
+        直接从 action_logits 采样，不需要文本解码
+        """
+        logits = self.predict_action_logits(input_ids, pixel_values, use_cache)
 
-            logits = out.action_logits[0, -1, :].clone() / (temperature + 1e-9)
+        if temperature < 0.01:
+            # greedy
+            action_idx = torch.argmax(logits[0]).item()
+            confidence = torch.softmax(logits[0], dim=-1)[action_idx].item()
+        else:
+            logits = logits[0] / (temperature + 1e-9)
             if top_p and top_p < 1.0:
                 sorted_l, sorted_i = torch.sort(logits, descending=True)
                 mask = torch.cumsum(F.softmax(sorted_l, dim=-1), dim=-1) > top_p
                 mask[1:], mask[0] = mask[:-1].clone(), False
                 logits[sorted_i[mask]] = -float('Inf')
-
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, 1).item()
+            action_idx = torch.multinomial(probs, 1).item()
+            confidence = probs[action_idx].item()
 
-            if next_token == eos_token_id:
-                finished[0] = True
+        if action_idx >= self.config.action_vocab_size:
+            action_idx = 8  # stay
+
+        return action_idx, confidence
+
+    def decode_action(self, token_id):
+        if token_id in self.action_id_to_token:
+            return self.action_id_to_token[token_id]
+        if token_id == 0:
+            return "<pad>"
+        if token_id == 1:
+            return "<stop>"
+        if token_id == 2:
+            return "<start>"
+        return f"<action_{token_id}>"
+
+    def encode_action(self, action):
+        if action in self.action_token_to_id:
+            return self.action_token_to_id[action]
+        return hash(action.lower().strip()) % 500 + 10
+
+
+class VLAController:
+    """
+    VLA 控制器：管理时序执行循环
+
+    真正的时序控制流程：
+    1. 获取当前观察 (图像)
+    2. 构造输入：图像 + 指令 + 历史动作
+    3. 模型预测下一动作
+    4. 执行动作 → 获取执行结果/新观察
+    5. 检查是否完成，循环或结束
+    """
+
+    def __init__(self, model: MiniMindVLAStep, tokenizer, max_steps=20, device='cuda'):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_steps = max_steps
+        self.device = device
+
+    def construct_input(self, instruction, history_actions, image_token="<|image_pad|>"):
+        """构造模型输入"""
+        prompt = f"Task: {instruction}"
+        prompt_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids
+
+        input_ids = [self.tokenizer.bos_token_id] + prompt_ids + [2]  # 2 = <start>
+
+        for action in history_actions:
+            action_id = self.model.encode_action(action)
+            input_ids.append(action_id)
+
+        input_ids.append(1)  # 1 = <stop>
+
+        return torch.tensor([input_ids], dtype=torch.long, device=self.device)
+
+    def step(self, instruction, history_actions, pixel_values):
+        """
+        执行一步：给定当前观察和历史，预测下一动作
+
+        Returns:
+            action_str: 预测的动作字符串
+            action_id: 预测的动作 ID
+            confidence: 置信度
+        """
+        input_ids = self.construct_input(instruction, history_actions)
+
+        if pixel_values is not None:
+            if isinstance(pixel_values, dict):
+                pixel_values = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in pixel_values.items()}
+            else:
+                pixel_values = pixel_values.to(self.device)
+
+        results = list(self.model.predict_next_action(
+            input_ids,
+            pixel_values=pixel_values,
+            max_new_tokens=5,
+            temperature=0.7,
+        ))
+
+        if not results:
+            return None, None, 0.0
+
+        action_id, confidence = results[0]
+        action_str = self.model.decode_action(action_id)
+
+        return action_str, action_id, confidence
+
+    def run_episode(self, instruction, get_observation_fn, execute_action_fn, is_done_fn=None):
+        """
+        运行一个完整的任务 episode
+
+        Args:
+            instruction: 任务指令
+            get_observation_fn: 获取当前观察的函数 () -> pixel_values
+            execute_action_fn: 执行动作的函数 (action_str) -> success
+            is_done_fn: 检查是否完成的函数 (action_str, history) -> bool
+
+        Returns:
+            executed_actions: 执行的动作列表
+            success: 是否成功完成任务
+        """
+        executed_actions = []
+        history = []
+
+        for step in range(self.max_steps):
+            pixel_values = get_observation_fn()
+
+            action_str, action_id, confidence = self.step(instruction, history, pixel_values)
+
+            if action_str is None or action_str in ("<pad>", "<stop>", "<start>"):
                 break
 
-            input_ids = torch.cat((input_ids, torch.tensor([[next_token]], device=input_ids.device)), dim=1)
+            executed_actions.append(action_str)
+            history.append(action_str)
 
-            if finished[0]:
+            success = execute_action_fn(action_str)
+
+            if not success:
                 break
 
-        return input_ids[:, start_pos:]
+            if is_done_fn and is_done_fn(action_str, history):
+                break
 
-    @torch.inference_mode()
-    def generate(self, input_ids, pixel_values=None, max_new_tokens=128, temperature=0.7, top_p=0.9, use_cache=True, return_actions=False, **args):
-        if return_actions:
-            return self.generate_actions(input_ids, pixel_values, max_new_tokens, temperature, top_p, use_cache)
-        return self.generate_actions(input_ids, pixel_values, max_new_tokens, temperature, top_p, use_cache)
+        return executed_actions, len(executed_actions) > 0 and executed_actions[-1] != "<stop>"

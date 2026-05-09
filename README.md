@@ -1,122 +1,152 @@
-# MiniMind-VLA: 真正的视觉-语言-动作模型
+# MiniMind-VLA: 真正的时序控制 VLA 模型
 
-## 项目概述
+## 核心特性
 
-MiniMind-VLA 是将 MiniMind-O（文本/语音/图像 → 文本/语音）改造而成的**真正的**视觉-语言-动作模型。
+**真正的时序控制能力**：每个时间步接收 (图像/状态 + 历史动作) → 输出下一动作
 
-### 与 ERA 的关系
-
-本项目借鉴了 [ERA (Embodied Reasoning Agent)](https://embodied-reasoning-agent.github.io/) 的思路。ERA 使用 3B 参数模型，本项目探索 **0.1B 小模型**做 VLA 的潜力。
-
-### 核心区别
-
-| 特性 | Mask Prediction (ERA EPL) | 真正的 VLA (MiniMind-VLA) |
-|------|---------------------------|---------------------------|
-| 输入 | instruction + 不完整 action seq + [MASK] | 图像 + instruction |
-| 输出 | 预测 [MASK] 位置填哪个 action | **自己生成**完整 action 序列 |
-| 训练目标 | 分类（从 vocabulary 选一个） | 序列生成（像翻译一样） |
-
-## 架构说明
+## 架构
 
 ```
-输入: 图像 + "Put the cup on the table"
-         ↓
-    ┌─────────────┐
-    │   SigLIP2   │  视觉编码器 (冻结)
-    │  Vision     │
-    │  Encoder    │
-    └──────┬──────┘
-           ↓
-    ┌─────────────┐
-    │   Vision    │  投影层 (训练)
-    │  Projector │
-    └──────┬──────┘
-           ↓
-    ┌─────────────┐
-    │             │
-    │   Thinker   │  MiniMind Transformer (训练)
-    │   (8层)     │
-    │             │
-    └──────┬──────┘
-           ↓ bridge_layer
-    ┌─────────────┐
-    │             │
-    │   Action    │  Action Module (训练)
-    │   (4层)     │
-    │             │
-    └──────┬──────┘
-           ↓
-    ┌─────────────┐
-    │  Action     │  输出: 动作序列
-    │  Head       │  "find cup → pick up → ..."
-    └─────────────┘
+时间步 t:
+输入 → Thinker (理解) → Action Module (决策) → A_t
+                              ↑
+历史动作 ←─────────────────────┘
 ```
 
-## 数据格式
-
-**真正的 VLA 数据格式：**
-```json
-{
-  "instruction": "Put the cup on the table",
-  "actions": ["find a cup", "pick up the cup", "find a table", "put down the cup"],
-  "image": "/path/to/image.jpg"
-}
-```
-
-## 快速开始
-
-### 1. 环境准备
+## 安装
 
 ```bash
-pip install torch transformers pyarrow pandas pillow
-pip install -r requirements.txt
+pip install gymnasium gymnasium-robotics mujoco pillow
 ```
 
-### 2. 下载预训练模型
+## 数据收集（训练集 + 测试集）
 
 ```bash
-# 下载 SigLIP2 视觉编码器
-modelscope download --model gongjy/siglip2-base-p32-256-ve --local_dir ./model/siglip2-base-p32-256-ve
-
-# 下载 MiniMind 语言模型权重
-modelscope download --model gongjy/minimind-3o-pytorch llm_768.pth --local_dir ./out
+# 收集训练集和测试集（使用不同随机种子确保不重叠）
+python scripts/collect_robot_data.py \
+    --env_id FetchSlide-v3 \
+    --num_episodes 1000 \
+    --train_ratio 0.8 \
+    --train_seed 42 \
+    --test_seed 12345 \
+    --output_dir dataset/robot_data
 ```
 
-### 3. 下载 ERA 数据集
+**重要**：
+- 训练集 seed=42，测试集 seed=12345
+- 测试集使用与训练集完全不同的初始状态
+- 评估时只用测试集，模拟泛化到未见过的任务
 
-```bash
-git clone https://huggingface.co/datasets/EmbodiedReasoningAgent/EB-ALFRED_trajectory_augmented_prior_dataset
-git clone https://huggingface.co/datasets/EmbodiedReasoningAgent/EB-ALFRED_environment_anchored_prior_dataset
-```
-
-### 4. 数据格式转换
-
-```bash
-python scripts/convert_era_to_vla.py \
-    --input_path /path/to/EB-ALFRED_trajectory_augmented_prior_dataset/data.json \
-    --output_path dataset/vla_alfred.json \
-    --images_folder /path/to/images
-```
-
-### 5. 开始训练
+## 训练
 
 ```bash
 cd trainer
 bash train_vla.sh
+# 训练数据: dataset/robot_data/train_trajectories.json
 ```
 
-### 6. 推理评估
+## 评估（测试集）
+
+### 方式 1：离线评估（数据集）
 
 ```bash
-cd scripts
-bash eval_vla.sh
+python eval_vla.py \
+    --checkpoint_path out/vla/final \
+    --eval_mode dataset \
+    --dataset_path dataset/robot_data/test_trajectories.json
+```
+
+### 方式 2：在线评估（仿真器）
+
+```bash
+python eval_vla.py \
+    --checkpoint_path out/vla/final \
+    --eval_mode simulator \
+    --env_id FetchSlide-v3 \
+    --num_episodes 100 \
+    --test_seed 12345
+```
+
+### 方式 3：同时评估
+
+```bash
+python eval_vla.py \
+    --checkpoint_path out/vla/final \
+    --eval_mode both
+```
+
+## 实验设计建议
+
+### 核心研究问题
+
+**"小规模 VLA (0.1B) 能否具备真正的时序控制能力？"**
+
+### 评估指标
+
+| 指标 | 说明 |
+|------|------|
+| **Success Rate** | 任务完成率（主要指标） |
+| **Episode Reward** | 累计奖励 |
+| **Step Accuracy** | 每步动作预测准确率 |
+| **History Sensitivity** | 历史依赖性 |
+
+### 消融实验
+
+| 消融项 | 变体 |
+|--------|------|
+| Bridge Layer | 无 / 第3层 / 第5层 |
+| Action Module 深度 | 2层 / 4层 / 6层 |
+| 历史动作长度 | 0 / 3 / 5 / 10 |
+| 数据规模 | 100 / 1K / 10K episodes |
+
+### 对比基线
+
+| 模型 | 参数量 | 说明 |
+|------|--------|------|
+| **MiniMind-VLA (Ours)** | 0.1B | 本方案 |
+| MiniMind-O (Omni) | 0.1B | 无时序控制版本 |
+| RT-2-X | 55B | 斯坦福 VLA 基线 |
+
+## 时序控制验证实验
+
+**验证方法**：给定相同初始观察，不同历史动作序列，观察模型输出差异
+
+```
+初始观察: O
+历史 A: [move_left] → 模型应输出不同动作
+历史 B: [move_right] → 模型应输出不同动作
+
+如果输出确实不同 → 证明模型利用了历史信息
+```
+
+## 数据格式
+
+```json
+{
+  "discrete_actions": ["move_left", "move_right", ...],
+  "train_seed": 42,
+  "test_seed": 12345,
+  "trajectories": [
+    {
+      "instruction": "puck is to the right of target",
+      "initial_state": {
+        "achieved_goal": [x, y, z],
+        "desired_goal": [x, y, z]
+      },
+      "steps": [
+        {"action": "move_left", "observation_text": "..."},
+        ...
+      ]
+    }
+  ]
+}
 ```
 
 ## 局限性
 
-1. **参数规模**：0.1B 规模远小于 ERA 的 3B
-2. **动作空间**：仅支持离散动作，不支持连续动作控制
-3. **无 RL 阶段**：仅有 SFT 训练
+1. **参数规模**：0.1B 规模限制复杂任务能力
+2. **离散动作**：当前使用离散动作，可扩展到连续动作
+3. **无 RL**：仅有 SFT，可参考 ERA 加入 Online RL
 
 ## 致谢
 
