@@ -9,7 +9,13 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
-from model.model_omni import MiniMindOmni
+
+# Import MiniMindOmni only if available (for compatibility)
+try:
+    from model.model_omni import MiniMindOmni
+except ImportError:
+    MiniMindOmni = None
+
 from torch.optim.lr_scheduler import LambdaLR
 
 

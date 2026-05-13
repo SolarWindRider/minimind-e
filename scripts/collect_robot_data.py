@@ -152,7 +152,7 @@ def encode_state_as_text(obs):
     return " ".join(instructions)
 
 
-def collect_trajectories(env_id='FetchSlide-v3', num_episodes=100, render_mode='rgb_array', max_steps=50, seed=None):
+def collect_trajectories(env_id='FetchSlide-v4', num_episodes=100, render_mode='rgb_array', max_steps=50, seed=None):
     """
     收集轨迹数据
 
@@ -191,17 +191,7 @@ def collect_trajectories(env_id='FetchSlide-v3', num_episodes=100, render_mode='
         }
 
         for step in range(max_steps):
-            # 渲染当前图像
-            if render_mode == 'rgb_array':
-                img = env.render()
-                if isinstance(img, list):
-                    img = img[0]
-                if img is None:
-                    img = np.zeros((480, 640, 3), dtype=np.uint8)
-            else:
-                img = np.zeros((480, 640, 3), dtype=np.uint8)
-
-            # 获取当前观察的文本描述
+            # 获取当前观察的文本描述（不渲染图像，因为无头服务器没有OpenGL）
             instruction = encode_state_as_text(obs)
 
             # 使用随机策略采集数据（也可以用训练好的策略）
@@ -212,7 +202,7 @@ def collect_trajectories(env_id='FetchSlide-v3', num_episodes=100, render_mode='
             obs, reward, terminated, truncated, info = env.step(continuous_action)
 
             episode_trajectory["steps"].append({
-                "image": img.tolist() if isinstance(img, np.ndarray) else img,
+                "image": [],  # No image on headless server
                 "action": DISCRETE_ACTIONS[discrete_action],
                 "action_idx": int(discrete_action),
                 "observation_text": instruction,
@@ -230,20 +220,36 @@ def collect_trajectories(env_id='FetchSlide-v3', num_episodes=100, render_mode='
     return trajectories
 
 
+def convert_to_serializable(obj):
+    """将numpy类型转换为Python原生类型"""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(item) for item in obj]
+    return obj
+
+
 def save_trajectories(trajectories, output_path):
     """保存轨迹数据"""
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
     # 保存为 JSON（适用于小数据集）
+    serializable_trajectories = convert_to_serializable(trajectories)
     with open(output_path, 'w') as f:
         json.dump({
             "discrete_actions": DISCRETE_ACTIONS,
             "action_threshold": ACTION_THRESHOLD,
-            "num_episodes": len(trajectories),
-            "trajectories": trajectories,
+            "num_episodes": len(serializable_trajectories),
+            "trajectories": serializable_trajectories,
         }, f, indent=2)
 
-    print(f"Saved {len(trajectories)} trajectories to {output_path}")
+    print(f"Saved {len(serializable_trajectories)} trajectories to {output_path}")
 
 
 def save_as_images(trajectories, output_dir):
@@ -364,9 +370,10 @@ def main():
     print(f"Metadata: {metadata_path}")
 
     if args.save_images:
-        save_as_images(trajectories, args.output_dir)
+        save_as_images(train_trajectories, args.output_dir) if 'train_trajectories' in dir() else save_as_images(test_trajectories, args.output_dir)
     else:
-        save_trajectories(trajectories, args.output_path)
+        if 'train_trajectories' in dir():
+            save_trajectories(train_trajectories, os.path.join(args.output_dir, "train_trajectories.json"))
 
     print("Done!")
 

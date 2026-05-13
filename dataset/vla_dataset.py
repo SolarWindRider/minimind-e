@@ -1,7 +1,11 @@
 import io, json, random, re, os, torch
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    HAS_PYARROW = True
+except ImportError:
+    HAS_PYARROW = False
 from torch.utils.data import Dataset
 from PIL import Image
 
@@ -61,7 +65,10 @@ class VLAStepDataset(Dataset):
             else:
                 with open(data_path) as f:
                     data = json.load(f)
-                    if isinstance(data, dict) and 'samples' in data:
+                    if isinstance(data, dict) and 'trajectories' in data:
+                        # New format: {"trajectories": [...]} from collect_robot_data.py
+                        self.list_data_dict = data['trajectories']
+                    elif isinstance(data, dict) and 'samples' in data:
                         self.list_data_dict = data['samples']
                     else:
                         self.list_data_dict = data
@@ -128,7 +135,11 @@ class VLAStepDataset(Dataset):
             if not steps or len(steps) < 2:
                 return self._get_dummy_sample()
 
-            history_size = random.randint(1, min(len(steps) - 1, self.max_history_steps))
+            if self.max_history_steps == 0:
+                # No history - predict first action from instruction only
+                history_size = 0
+            else:
+                history_size = random.randint(1, min(len(steps) - 1, self.max_history_steps))
             history_steps = steps[:history_size]
             target_step = steps[history_size]
 

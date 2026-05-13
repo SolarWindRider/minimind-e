@@ -129,6 +129,24 @@ class MiniMindVLAStep(nn.Module):
         self.vision_encoder = vision_encoder
         self.vision_processor = vision_processor
 
+    def resize_token_embeddings(self, new_num_tokens):
+        """Resize token embeddings when tokenizer size changes"""
+        if new_num_tokens is None or new_num_tokens == self.thinker.embed_tokens.num_embeddings:
+            return
+        # Resize thinker's embeddings
+        old_emb = self.thinker.embed_tokens
+        new_emb = nn.Embedding(new_num_tokens, old_emb.embedding_dim, device=old_emb.weight.device, dtype=old_emb.weight.dtype)
+        num_copy = min(old_emb.num_embeddings, new_num_tokens)
+        new_emb.weight.data[:num_copy] = old_emb.weight.data[:num_copy].clone()
+        self.thinker.embed_tokens = new_emb
+        # Resize lm_head if it shares weights
+        if self.lm_head.weight.shape[0] == old_emb.num_embeddings:
+            old_head = self.lm_head
+            new_head = nn.Linear(old_head.in_features, new_num_tokens, bias=False, device=old_head.weight.device, dtype=old_head.weight.dtype)
+            new_head.weight.data[:num_copy] = old_head.weight.data[:num_copy].clone()
+            self.lm_head = new_head
+            self.thinker.lm_head = self.lm_head
+
     def _load_vision(self, path):
         if path is None or not os.path.exists(path):
             warnings.warn(f"[MiniMindVLAStep] Vision model path not found: {path}")
@@ -242,7 +260,10 @@ class MiniMindVLAStep(nn.Module):
                 bridge_states = hidden_states
         h_thinker = self.thinker.norm(hidden_states)
 
-        action_emb = self.action.embed_tokens(input_ids)
+        action_ids_for_emb = input_ids.clone()
+        action_ids_for_emb = action_ids_for_emb - 10
+        action_ids_for_emb = action_ids_for_emb.clamp(0, self.config.action_vocab_size - 1)
+        action_emb = self.action.embed_tokens(action_ids_for_emb)
         action_hidden = self.action.embed_proj(bridge_states) * self.action.text_scale + action_emb
         action_position_embeddings = (self.action.freqs_cos[start_pos:start_pos + seq_length],
                                      self.action.freqs_sin[start_pos:start_pos + seq_length])

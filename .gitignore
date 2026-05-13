@@ -6,3 +6,6 @@ __pycache__/
 .claude/
 .specstory/
 .env
+out
+shared*
+*log*

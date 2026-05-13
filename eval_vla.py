@@ -238,7 +238,7 @@ def main():
 
     checkpoint_file = os.path.join(args.checkpoint_path, "pytorch_model.bin")
     if os.path.exists(checkpoint_file):
-        checkpoint = torch.load(checkpoint_file, map_location=args.device)
+        checkpoint = torch.load(checkpoint_file, map_location=args.device, weights_only=False)
         vla_config = checkpoint.get('config', VLAConfig())
         action_vocab = checkpoint.get('action_vocab', DISCRETE_ACTIONS)
     else:
@@ -246,9 +246,10 @@ def main():
         action_vocab = DISCRETE_ACTIONS
 
     model = MiniMindVLAStep(vla_config, vision_model_path=args.vision_model_path)
-    model.resize_token_embeddings(len(tokenizer))
     if os.path.exists(checkpoint_file):
         model.load_state_dict(checkpoint.get('model', checkpoint), strict=False)
+    else:
+        model.resize_token_embeddings(len(tokenizer))
     model.set_action_vocabulary(action_vocab)
     model = model.to(args.device)
 
